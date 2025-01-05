@@ -1,5 +1,3 @@
-% %
-    writefile hw4_ex3.cu
 #include <cublas_v2.h>
 #include <cuda_runtime_api.h>
 #include <cusparse_v2.h>
@@ -40,14 +38,19 @@
         }                                                             \
     } while (0)
 
-    struct timeval t_start,
-    t_end;
-void cputimer_start() { gettimeofday(&t_start, 0); }
-double cputimer_stop(const char *info) {
-    gettimeofday(&t_end, 0);
+struct timeval t_start, t_end;
+void cputimer_start() { gettimeofday(&t_start, nullptr); }
+void cputimer_stop(const char *info) {
+    gettimeofday(&t_end, nullptr);
     double time = (1000000.0 * (t_end.tv_sec - t_start.tv_sec) + t_end.tv_usec -
                    t_start.tv_usec);
     printf("Timing - %s. \t\tElasped %.0f microseconds \n", info, time);
+}
+
+double cputimer_stop() {
+    gettimeofday(&t_end, nullptr);
+    double time = (1000000.0 * (t_end.tv_sec - t_start.tv_sec) + t_end.tv_usec -
+                   t_start.tv_usec);
     return time;
 }
 
@@ -76,13 +79,15 @@ void matrixInit(double *A, int *ArowPtr, int *AcolIndx, int dimX,
     ArowPtr[dimX] = ptr;
 }
 
-float calculateFLOPS(int nvz, int dimX, float time_ms) {
+float calculateFLOPS(int nvz, double time_ms) {
     // nvz: Number of non-zero elements in the sparse matrix
-    // dimX: Dimension of the output vector
     // time_ms: Kernel execution time in milliseconds
-    float ops = 3.0f * nvz * dimX;  // Each 1*A*temp + 0*tmp operation counts as
-                                    // 3 FLOPS, 1 multiply/add and 2 multiply
-    return ops / (time_ms / 1000.0f);  // Convert ms to seconds
+    if (time_ms < 0.) {
+        printf("ERROR: time negative");
+    }
+    double ops = 2.0f * nvz;  // Each 1*A*temp + 0*tmp operation counts as 1 add
+                              // and 1 multiply per element
+    return ops / (time_ms / 1000.f);
 }
 
 int main(int argc, char **argv) {
@@ -108,6 +113,7 @@ int main(int argc, char **argv) {
     cublasHandle_t cublasHandle;      // cuBLAS handle
     cusparseHandle_t cusparseHandle;  // cuSPARSE handle
     int prefetch;                     // Flag to prefetch memory
+    struct timeval t_start_run;
 
     cusparseSpMatDescr_t Adescriptor;  // Mat descriptor needed by cuSPARSE
     cusparseDnVecDescr_t vecX;         // Input vector descriptor
@@ -145,6 +151,7 @@ int main(int argc, char **argv) {
     //@@ Insert the code to allocate the temp, tmp and the sparse matrix
     //@@ arrays using Unified Memory
     cputimer_start();
+    t_start_run = t_start;
     cudaMallocManaged(&temp, sizeof(double) * dimX);
     cudaMallocManaged(&tmp, sizeof(double) * dimX);
     cudaMallocManaged(&A, sizeof(double) * nzv);
@@ -221,7 +228,9 @@ int main(int argc, char **argv) {
     // Perform the time step iterations
     std::vector<double> flops;
     flops.reserve(nsteps);
-    double time_ms;
+    std::vector<double> timesPerIteration;
+    timesPerIteration.reserve(nsteps);
+    double time_ms = 1.;
     for (int it = 0; it < nsteps; ++it) {
         cputimer_start();
         //@@ Insert code to call cusparse api to compute the SMPV (sparse matrix
@@ -231,9 +240,10 @@ int main(int argc, char **argv) {
         cusparseSpMV(cusparseHandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &one,
                      Adescriptor, vecX, &zero, vecY, CUDA_R_64F,
                      CUSPARSE_SPMV_ALG_DEFAULT, buffer);
-        time_ms = cputimer_stop("SMPV");
+        time_ms = cputimer_stop();
+        timesPerIteration.push_back(time_ms);
         // compute flops
-        flops.push_back(calculateFLOPS(nzv, dimX, time_ms));
+        flops.push_back(calculateFLOPS(nzv, time_ms));
         //@@ Insert code to call cublas api to compute the axpy routine using
         // cuBLAS.
         //@@ This calculation corresponds to: temp = alpha * tmp + temp
@@ -254,31 +264,36 @@ int main(int argc, char **argv) {
                      (tempRight - tempLeft) / (dimX - 1));
 
     // Calculate the relative approximation error:
-    one = -1;
+    one = -1.;
     //@@ Insert the code to call cublas api to compute the difference between
     // the exact solution
     //@@ and the approximation
-    //@@ This calculation corresponds to: tmp = -temp + tmp
-    cublasDaxpy(cublasHandle, dimX, &one, temp, 1, tmp, 1);
+    //@@ This calculation corresponds to: temp = -tmp + temp
+    cublasDaxpy(cublasHandle, dimX, &one, tmp, 1, temp, 1);
 
     //@@ Insert the code to call cublas api to compute the norm of the absolute
     // error
     //@@ This calculation corresponds to: || tmp ||
-    cublasDnrm2(cublasHandle, dimX, tmp, 1, &norm);
+    cublasDnrm2(cublasHandle, dimX, temp, 1, &norm);
 
     error = norm;
     //@@ Insert the code to call cublas api to compute the norm of temp
-    //@@ This calculation corresponds to: || temp ||
-    cublasDnrm2(cublasHandle, dimX, temp, 1, &norm);
+    //@@ This calculation corresponds to: || tmp ||
+    cublasDnrm2(cublasHandle, dimX, tmp, 1, &norm);
 
     // Calculate average FLOPS for given size
-    double avgFlops = std::accumulate(flops.begin(), flops.end(), 0) /
+    double avgLoopTime = std::accumulate(timesPerIteration.begin(),
+                                         timesPerIteration.end(), 0.) /
+                         static_cast<double>(timesPerIteration.size());
+    double avgFlops = std::accumulate(flops.begin(), flops.end(), 0.) /
                       static_cast<double>(flops.size());
-    printf("The estimated FLOPS are %f\n", avgFlops);
+    printf("The estimated FLOPS are %f, avg. SPMV is %f\n", avgFlops,
+           avgLoopTime);
 
     // Calculate the relative error
     error = error / norm;
-    printf("The relative error of the approximation is %f\n", error);
+    printf("The relative error of the approximation is %f on nsteps %d\n",
+           error, nsteps);
 
     //@@ Insert the code to destroy the mat descriptor
     cusparseDestroySpMat(Adescriptor);
@@ -298,6 +313,11 @@ int main(int argc, char **argv) {
     cudaFree(ARowPtr);
     cudaFree(AColIndx);
     cudaFree(buffer);
+
+    // stop Timing
+    t_start = t_start_run;
+    double runtime = cputimer_stop();
+    printf("Total runtime: %f ms\n\n", runtime);
 
     return 0;
 }
